@@ -10,7 +10,7 @@ import torch.nn as nn
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.tasks import DetectionModel, DetectionModelErd
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.plotting import plot_images, plot_labels, plot_results
 from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
@@ -85,9 +85,20 @@ class DetectionTrainer(BaseTrainer):
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Return a YOLO detection model."""
-        model = DetectionModel(cfg, nc=self.data["nc"], verbose=verbose and RANK == -1)
+        if self.Continuous is not None:
+            model = DetectionModelErd(cfg, 
+                                      nc=self.data["nc"], 
+                                      verbose=verbose and RANK == -1, 
+                                      t_model_nc=self.Continuous.model[-1].nc,
+                                      t_stride=self.Continuous.model[-1].stride, 
+                                      add_on_indexs=self.add_on_indexes)
+        else:
+            model = DetectionModel(cfg, nc=self.data["nc"], verbose=verbose and RANK == -1)
         if weights:
-            model.load(weights)
+            if self.Continuous is not None:
+                model.load(weights, ori_nc=self.Continuous.model[-1].nc)
+            else:
+                model.load(weights)
         return model
 
     def get_validator(self):

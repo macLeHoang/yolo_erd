@@ -67,6 +67,7 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    v8ERDDetectionLoss
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -382,8 +383,65 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        if getattr(self, "end2end", False):
+            return E2EDetectLoss(self)  
+        else:
+            return v8DetectionLoss(self)
+        
 
+class DetectionModelErd(DetectionModel):
+    def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True, 
+                 t_model_nc=None, t_stride=None, add_on_indexs=None):  # model, input channels, number of classes
+        super().__init__(cfg, ch, nc, verbose)
+        
+        self.nc_origin = t_model_nc
+        self.t_stride = t_stride
+        self.add_on_indexes = add_on_indexs
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        return v8ERDDetectionLoss(
+                self, 
+                self.add_on_indexes, 
+                nc_origin=self.nc_origin, 
+                t_stride=self.t_stride
+            ) # TODO
+
+    def loss(self, batch, preds=None, t_preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on
+            preds (torch.Tensor | List[torch.Tensor]): Predictions.
+        """
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion() 
+
+        preds = self.forward(batch["img"]) if preds is None else preds
+        return self.criterion(preds, t_preds, batch)
+
+    def load(self, weights, verbose=True, ori_nc=80):
+        """
+        Load the weights into the model.
+
+        Args:
+            weights (dict | torch.nn.Module): The pre-trained weights to be loaded.
+            verbose (bool, optional): Whether to log the transfer progress. Defaults to True.
+        """
+        model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
+        state_dict = model.float().state_dict()  # checkpoint state_dict as FP32
+        csd = intersect_dicts(state_dict, self.state_dict())  # intersect
+
+        for k in state_dict.keys():
+            if k not in csd:
+                csd[k] = torch.cat([
+                            state_dict[k], self.state_dict()[k][ori_nc:]
+                        ], dim=0)
+
+        self.load_state_dict(csd, strict=True)  # load
+        if verbose:
+            LOGGER.info(f"Transferred {len(csd)}/{len(self.model.state_dict())} items from pretrained weights")
 
 class OBBModel(DetectionModel):
     """YOLOv8 Oriented Bounding Box (OBB) model."""

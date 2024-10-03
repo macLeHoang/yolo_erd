@@ -153,6 +153,12 @@ class BaseTrainer:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
         if RANK in {-1, 0}:
             callbacks.add_integration_callbacks(self)
+        
+        # ERD
+        self.Continuous = overrides["Continuous"] # t_model
+        overrides.pop("Continuous")
+
+        self.add_on_indexes = self.data["add_on_indexes"]
 
     def add_callback(self, event: str, callback):
         """Appends the given callback."""
@@ -256,6 +262,18 @@ class BaseTrainer:
                     "See ultralytics.engine.trainer for customization of frozen layers."
                 )
                 v.requires_grad = True
+            
+        if self.Continuous is not None:
+            LOGGER.info("Loadding Continuous model weights...")
+            t_weights, t_ckpt = attempt_load_one_weight(self.Continuous.pt_path)
+            self.Continuous.load(t_weights)
+
+            for k, v in self.Continuous.named_parameters():
+                v.requires_grad = False
+
+            self.Continuous.model[-1].erd = True
+            self.Continuous = self.Continuous.to(self.device)
+            self.Continuous.eval()
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
@@ -382,7 +400,11 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    self.loss, self.loss_items = self.model(batch)
+                    if self.Continuous is not None:
+                        t_preds = self.Continuous(batch["img"])
+                        self.loss, self.loss_items = self.model(batch, t_preds=t_preds)
+                    else:
+                        self.loss, self.loss_items = self.model(batch)
                     if RANK != -1:
                         self.loss *= world_size
                     self.tloss = (

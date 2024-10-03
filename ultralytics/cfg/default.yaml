@@ -124,3 +124,9 @@ cfg: # (str, optional) for overriding defaults.yaml
 
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
+
+# Continuous settings ------------------------------------------------------------------------------------------------------
+Continuous: null
+kl_gain: 0.25
+cls_disstil_gain: 1.0
+dist_loss_weight: 1.0

@@ -1,8 +1,12 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import nms
+
+from typing import Optional
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -11,6 +15,7 @@ from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
+from .utils import weighted_loss
 
 
 class VarifocalLoss(nn.Module):
@@ -740,3 +745,437 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+
+@weighted_loss
+def knowledge_distillation_kl_div_loss(pred,
+                                       soft_label,
+                                       T: int,
+                                       detach_target: bool = True):
+    r"""Loss function for knowledge distilling using KL divergence.
+
+    Args:
+        pred (Tensor): Predicted logits with shape (N, n + 1).
+        soft_label (Tensor): Target logits with shape (N, N + 1).
+        T (int): Temperature for distillation.
+        detach_target (bool): Remove soft_label from automatic differentiation
+
+    Returns:
+        Tensor: Loss tensor with shape (N,).
+    """
+    assert pred.size() == soft_label.size()
+    target = F.softmax(soft_label / T, dim=1)
+    if detach_target:
+        target = target.detach()
+
+    kd_loss = F.kl_div(
+        F.log_softmax(pred / T, dim=1), target, reduction='none').mean(1) * (T * T)
+
+    return kd_loss
+
+class KnowledgeDistillationKLDivLoss(nn.Module):
+    """Loss function for knowledge distilling using KL divergence.
+
+    Args:
+        reduction (str): Options are `'none'`, `'mean'` and `'sum'`.
+        loss_weight (float): Loss weight of current loss.
+        T (int): Temperature for distillation.
+    """
+
+    def __init__(self,
+                 reduction: str = 'mean',
+                 loss_weight: float = 1.0,
+                 T: int = 10) -> None:
+        super().__init__()
+        assert T >= 1
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.T = T
+    
+
+    def forward(self,
+                pred: Tensor,
+                soft_label: Tensor,
+                weight: Optional[Tensor] = None,
+                avg_factor: Optional[int] = None,
+                reduction_override: Optional[str] = None) -> Tensor:
+        """Forward function.
+
+        Args:
+            pred (Tensor): Predicted logits with shape (N, n + 1).
+            soft_label (Tensor): Target logits with shape (N, N + 1).
+            weight (Tensor, optional): The weight of loss for each
+                prediction. Defaults to None.
+            avg_factor (int, optional): Average factor that is used to average
+                the loss. Defaults to None.
+            reduction_override (str, optional): The reduction method used to
+                override the original reduction method of the loss.
+                Defaults to None.
+
+        Returns:
+            Tensor: Loss tensor.
+        """
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+
+        loss_kd = self.loss_weight * knowledge_distillation_kl_div_loss(
+                                        pred,
+                                        soft_label,
+                                        weight,
+                                        reduction=reduction,
+                                        avg_factor=avg_factor,
+                                        T=self.T
+                                    )
+
+        return loss_kd
+
+
+@weighted_loss
+def quality_focal_loss(pred, target, fg_mask, add_on_indexes, beta=2.0, use_sigmoid=True):
+    r"""Quality Focal Loss (QFL) is from `Generalized Focal Loss: Learning
+    Qualified and Distributed Bounding Boxes for Dense Object Detection
+    <https://arxiv.org/abs/2006.04388>`_.
+
+    Args:
+        pred (torch.Tensor): Predicted joint representation of classification
+            and quality (IoU) estimation with shape (N, C), C is the number of
+            classes.
+        target (tuple([torch.Tensor])): Target category label with shape (N,)
+            and target quality label with shape (N,).
+        beta (float): The beta parameter for calculating the modulating factor.
+            Defaults to 2.0.
+
+    Returns:
+        torch.Tensor: Loss tensor with shape (N,).
+    """
+    assert len(target) == 2, """target for QFL must be a tuple of two elements,
+        including category label and quality label, respectively"""
+    # label denotes the category id, score denotes the quality score
+    label, score = target
+    if use_sigmoid:
+        func = F.binary_cross_entropy_with_logits
+    else:
+        func = F.binary_cross_entropy
+
+    # negatives are supervised by 0 quality score
+    pred_sigmoid = pred.sigmoid() if use_sigmoid else pred
+    scale_factor = pred_sigmoid
+    zerolabel = scale_factor.new_zeros(pred.shape)
+    loss = func(pred, zerolabel, reduction='none') * scale_factor.pow(beta)
+
+    # FG cat_id: [0, num_classes-1], BG cat_id: num_classes
+    # bg_class_ind = pred.size(1) + 1
+    # pos = ((label >= 0) & (label < bg_class_ind)).nonzero().squeeze(1)
+    # pos_label = label[pos].long()
+    # # positives are supervised by bbox quality (IoU) score
+    # scale_factor = score[pos] - pred_sigmoid[pos, pos_label]
+    # loss[pos, pos_label] = func(pred[pos, pos_label], score[pos],
+    #     reduction='none') * scale_factor.abs().pow(beta)
+
+    # pos = fg_mask.nonzero().squeeze().long()
+    # scale_factor = score - pred_sigmoid[pos, label.long()]
+    # loss[pos, label.long()] = func(pred[pos, label.long()].squeeze(), score, 
+    #     reduction='none') * scale_factor.abs().pow(beta)
+
+    pos = fg_mask.nonzero().squeeze().long()
+    pos_label = label.long()
+    scale_factor = score[pos, pos_label] - pred_sigmoid[pos, pos_label]
+    loss[pos, pos_label] = func(
+                            pred[pos, pos_label].squeeze(), 
+                            score[pos, pos_label].squeeze(), 
+                            reduction='none'
+                            ) * scale_factor.abs().pow(beta)
+    
+    loss = loss[:, add_on_indexes]
+    loss = loss.sum(dim=1, keepdim=False)
+    return loss
+
+class QualityFocalLoss(nn.Module):
+    r"""Quality Focal Loss (QFL) is a variant of `Generalized Focal Loss:
+    Learning Qualified and Distributed Bounding Boxes for Dense Object
+    Detection <https://arxiv.org/abs/2006.04388>`_.
+
+    Args:
+        use_sigmoid (bool): Whether sigmoid operation is conducted in QFL.
+            Defaults to True.
+        beta (float): The beta parameter for calculating the modulating factor.
+            Defaults to 2.0.
+        reduction (str): Options are "none", "mean" and "sum".
+        loss_weight (float): Loss weight of current loss.
+    """
+
+    def __init__(self,
+                 use_sigmoid=True,
+                 beta=2.0,
+                 reduction='mean',
+                 loss_weight=1.0):
+        
+        super(QualityFocalLoss, self).__init__()
+        self.use_sigmoid = use_sigmoid
+        self.beta = beta
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+
+    def forward(self,
+                pred,
+                target,
+                weight=None,
+                fg_mask=None,
+                add_on_indexes=None,
+                avg_factor=None,
+                reduction_override=None):
+        """Forward function.
+
+        Args:
+            pred (torch.Tensor): Predicted joint representation of
+                classification and quality (IoU) estimation with shape (N, C),
+                C is the number of classes.
+            target (tuple([torch.Tensor])): Target category label with shape
+                (N,) and target quality label with shape (N,).
+            weight (torch.Tensor, optional): The weight of loss for each
+                prediction. Defaults to None.
+            avg_factor (int, optional): Average factor that is used to average
+                the loss. Defaults to None.
+            reduction_override (str, optional): The reduction method used to
+                override the original reduction method of the loss.
+                Defaults to None.
+        """
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+        loss_cls = self.loss_weight * quality_focal_loss(
+            pred,
+            target,
+            weight,
+            fg_mask=fg_mask,
+            add_on_indexes=add_on_indexes,
+            beta=self.beta,
+            use_sigmoid=self.use_sigmoid,
+            reduction=reduction,
+            avg_factor=avg_factor)
+        return loss_cls
+
+
+class v8ERDDetectionLoss:
+    def __init__(
+            self, 
+            model, 
+            add_on_indexes=None,
+            tal_topk=10,
+            nc_origin=80,
+            t_stride=None,
+    ):
+        device = next(model.parameters()).device  # get model device
+        h = model.args  # hyperparameters
+
+        m = model.model[-1]  # Detect() module
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.hyp = h
+        self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.no = m.nc + m.reg_max * 4
+        self.reg_max = m.reg_max
+        self.device = device
+
+        self.use_dfl = m.reg_max > 1
+
+        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+        self.kdl = KnowledgeDistillationKLDivLoss(loss_weight=self.hyp.kl_gain, T=5).to(device)
+        self.qfl = QualityFocalLoss()
+
+        self.t_no = nc_origin + m.reg_max * 4
+        self.nc_origin = nc_origin
+        self.t_stride = t_stride
+
+        self.add_on_indexes = add_on_indexes
+
+
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 5, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 5, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        return out
+
+
+    def bbox_decode(self, anchor_points, pred_dist):
+        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        if self.use_dfl:
+            b, a, c = pred_dist.shape  # batch, anchors, channels
+            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
+        return dist2bbox(pred_dist, anchor_points, xywh=False)
+
+
+    def __call__(self, preds, t_preds, batch):
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        erd_loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1)
+        
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous() # [1, 8400, nc]
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous() # [1, 8400, 64]
+        
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # targets
+        targets = torch.cat((batch['batch_idx'].view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+
+        # pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+
+        target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        ################################ ERD Loss #################################################
+        # when using ERD, selected add-on classes only for calculating loss with ground-truth
+        erd_pred_scores = pred_scores[:, :, self.add_on_indexes]
+        erd_target_scores = target_scores[:, :, self.add_on_indexes]
+
+        target_bboxes /= stride_tensor
+        target_scores_sum = max(erd_target_scores.sum(), 1)
+
+        # cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        # erd_loss[1] = self.bce(erd_pred_scores, erd_target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        scores = torch.zeros(batch_size, pred_scores.size(1)).to(self.device)
+        label_weights = torch.ones(batch_size, pred_scores.size(1)).to(self.device)
+        for i in range(batch_size):
+            # scores = bbox_iou(pred_bboxes[i][fg_mask[i]], target_bboxes[i][fg_mask[i]], xywh=False, CIoU=False).squeeze()
+            scores = target_scores[i]
+            erd_loss[1] += self.qfl(
+                pred_scores[i], (target_labels[i][fg_mask[i]].to(dtype), scores.to(dtype)),
+                label_weights[i],
+                fg_mask[i],
+                self.add_on_indexes,
+                avg_factor=1.0
+            )
+        erd_loss[1] = erd_loss[1].sum() / target_scores_sum
+
+        # bbox loss
+        if fg_mask.sum():
+            erd_loss[0], erd_loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, erd_target_scores,
+                                              target_scores_sum, fg_mask)
+
+        erd_loss[0] *= self.hyp.box  # box gain
+        erd_loss[1] *= self.hyp.cls  # cls gain
+        erd_loss[2] *= self.hyp.dfl  # dfl gain
+
+        # When validatiing or testing, there are no predictions from t_model
+        if t_preds is None:
+            return erd_loss.sum() * batch_size, erd_loss.detach()
+        
+        ################################ Distill Loss #################################################
+        distill_loss = torch.zeros(3, device=self.device)  # box, cls, dfl=0
+
+        t_feats = t_preds[1] if isinstance(t_preds, tuple) else t_preds
+        t_feats = [t_feat for t_feat in t_feats]
+        t_pred_distri, t_pred_scores = torch.cat([xi.view(t_feats[0].shape[0], self.t_no, -1) for xi in t_feats], 2).split(
+            (self.reg_max * 4, self.nc_origin), 1)
+        
+        t_pred_scores = t_pred_scores.permute(0, 2, 1).contiguous() # [1, 8400, nc]
+        t_pred_distri = t_pred_distri.permute(0, 2, 1).contiguous() # [1, 8400, 64]
+        s_pred_scores = pred_scores[:, :, :self.nc_origin]
+
+        # Get techer's valid boxes
+        t_anchor_points, t_stride_tensor = make_anchors(t_feats, self.t_stride, 0.5)
+        t_pred_bboxes = self.bbox_decode(t_anchor_points, t_pred_distri)  # xyxy, (b, h*w, 4)
+        t_pred_bboxes = t_pred_bboxes * t_stride_tensor
+
+        t_cls_conf = t_pred_scores.sigmoid()
+        max_cls_conf, ids = t_cls_conf.max(dim=-1) # (b, h*w)
+        cls_thr = max_cls_conf.mean(dim=-1) + 2 * max_cls_conf.std(dim=-1) # (b, )
+        t_bbox_valid_mask = max_cls_conf > cls_thr[:, None].expand(batch_size, max_cls_conf.size(-1))
+        topk_t_bbox_inds = [
+            t_bbox_valid_mask[i].nonzero(as_tuple=False).squeeze(1) 
+                                                for i in range(batch_size)
+        ] # Get ~2% total of boxes 
+
+        #*********************** label ***********************
+        topk_s_pred_scores = [
+            s_pred_scores[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        topk_t_pred_scores = [
+            t_pred_scores[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        
+        for i in range(batch_size):
+            assert topk_s_pred_scores[i].size() == topk_t_pred_scores[i].size()
+            distill_loss[1] += self.hyp.dist_loss_weight * \
+                        self.hyp.cls_disstil_gain * torch.mean((topk_s_pred_scores[i] - topk_t_pred_scores[i]).pow(2).float()) / batch_size
+
+        #*********************** Valid Boxes ***********************
+        topk_t_bbox_preds = [
+            t_pred_bboxes[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        topk_t_conf = [
+            max_cls_conf[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        topk_t_bbox_preds_nms_idx = [
+            nms(
+                topk_t_bbox_preds[i], 
+                topk_t_conf[i],
+                iou_threshold=self.hyp.iou
+            )[:self.hyp.max_det]
+            for i in range(batch_size)
+        ]
+
+        topk_t_bbox_distri = [
+            t_pred_distri[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        nms_topk_t_bbox_distri = [
+            topk_t_bbox_distri[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
+        ]
+
+        topk_s_bbox_distri = [
+            pred_distri[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        nms_topk_s_bbox_distri = [
+            topk_s_bbox_distri[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
+        ]
+
+        for i in range(batch_size):
+            s_topk_bbox_corner = nms_topk_s_bbox_distri[i].reshape(-1, self.reg_max)
+            t_topk_bbox_corner = nms_topk_t_bbox_distri[i].reshape(-1, self.reg_max)
+
+            weight_targets = topk_s_pred_scores[i].reshape(-1, self.nc_origin).detach().sigmoid()
+            weight_targets = weight_targets.max(dim=1)[0][topk_t_bbox_preds_nms_idx[i]]
+
+            distill_loss[0] += self.hyp.dist_loss_weight * self.kdl(
+                                                            s_topk_bbox_corner, t_topk_bbox_corner,
+                                                            weight=weight_targets[:, None].expand(-1, 4).reshape(-1), 
+                                                            avg_factor=1.0
+                                                        )
+
+        return erd_loss.sum() * batch_size + distill_loss.sum(), \
+               erd_loss.detach() + distill_loss.detach() # loss(box, cls, dfl)
+    
