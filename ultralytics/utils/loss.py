@@ -865,22 +865,14 @@ def quality_focal_loss(pred, target, fg_mask, add_on_indexes, beta=2.0, use_sigm
     zerolabel = scale_factor.new_zeros(pred.shape)
     loss = func(pred, zerolabel, reduction='none') * scale_factor.pow(beta)
 
-    # FG cat_id: [0, num_classes-1], BG cat_id: num_classes
-    # bg_class_ind = pred.size(1) + 1
-    # pos = ((label >= 0) & (label < bg_class_ind)).nonzero().squeeze(1)
-    # pos_label = label[pos].long()
-    # # positives are supervised by bbox quality (IoU) score
-    # scale_factor = score[pos] - pred_sigmoid[pos, pos_label]
-    # loss[pos, pos_label] = func(pred[pos, pos_label], score[pos],
-    #     reduction='none') * scale_factor.abs().pow(beta)
-
     # pos = fg_mask.nonzero().squeeze().long()
-    # scale_factor = score - pred_sigmoid[pos, label.long()]
-    # loss[pos, label.long()] = func(pred[pos, label.long()].squeeze(), score, 
+    # pos_label = label[fg_mask].long()
+    # scale_factor = score - pred_sigmoid[pos, pos_label]
+    # loss[pos, pos_label] = func(pred[pos, pos_label].squeeze(), score, 
     #     reduction='none') * scale_factor.abs().pow(beta)
 
     pos = fg_mask.nonzero().squeeze().long()
-    pos_label = label.long()
+    pos_label = label[fg_mask].long()
     scale_factor = score[pos, pos_label] - pred_sigmoid[pos, pos_label]
     loss[pos, pos_label] = func(
                             pred[pos, pos_label].squeeze(), 
@@ -985,7 +977,7 @@ class v8ERDDetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
-        self.kdl = KnowledgeDistillationKLDivLoss(loss_weight=self.hyp.kl_gain, T=5).to(device)
+        self.kdl = KnowledgeDistillationKLDivLoss(loss_weight=self.hyp.kl_gain, T=10).to(device) # T = 5
         self.qfl = QualityFocalLoss()
 
         self.t_no = nc_origin + m.reg_max * 4
@@ -1025,7 +1017,7 @@ class v8ERDDetectionLoss:
 
     def __call__(self, preds, t_preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        erd_loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        erd_loss = torch.zeros(5, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1)
@@ -1066,20 +1058,29 @@ class v8ERDDetectionLoss:
 
         # cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        # erd_loss[1] = self.bce(erd_pred_scores, erd_target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # erd_loss[1] = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum  # BCE
+
+        try:
+            bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
+        except:
+            fg_mask = fg_mask.bool()
+            bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
+
         scores = torch.zeros(batch_size, pred_scores.size(1)).to(self.device)
         label_weights = torch.ones(batch_size, pred_scores.size(1)).to(self.device)
         for i in range(batch_size):
-            # scores = bbox_iou(pred_bboxes[i][fg_mask[i]], target_bboxes[i][fg_mask[i]], xywh=False, CIoU=False).squeeze()
+            # scores = bbox_iou(pred_bboxes[i][fg_mask[i]], target_bboxes[i][fg_mask[i]], xywh=False, CIoU=True).squeeze()
             scores = target_scores[i]
             erd_loss[1] += self.qfl(
-                pred_scores[i], (target_labels[i][fg_mask[i]].to(dtype), scores.to(dtype)),
+                pred_scores[i], (target_labels[i].to(dtype), scores.to(dtype)),
                 label_weights[i],
                 fg_mask[i],
                 self.add_on_indexes,
                 avg_factor=1.0
-            )
-        erd_loss[1] = erd_loss[1].sum() / target_scores_sum
+            ).sum()
+
+        d = 0.25
+        erd_loss[1] = d * erd_loss[1] / target_scores_sum + (1 - d) * bce 
 
         # bbox loss
         if fg_mask.sum():
@@ -1095,7 +1096,7 @@ class v8ERDDetectionLoss:
             return erd_loss.sum() * batch_size, erd_loss.detach()
         
         ################################ Distill Loss #################################################
-        distill_loss = torch.zeros(3, device=self.device)  # box, cls, dfl=0
+        # distill_loss = torch.zeros(3, device=self.device)  # box, cls, dfl=0
 
         t_feats = t_preds[1] if isinstance(t_preds, tuple) else t_preds
         t_feats = [t_feat for t_feat in t_feats]
@@ -1113,12 +1114,12 @@ class v8ERDDetectionLoss:
 
         t_cls_conf = t_pred_scores.sigmoid()
         max_cls_conf, ids = t_cls_conf.max(dim=-1) # (b, h*w)
-        cls_thr = max_cls_conf.mean(dim=-1) + 2 * max_cls_conf.std(dim=-1) # (b, )
+        cls_thr = max_cls_conf.mean(dim=-1) + 2.11 * max_cls_conf.std(dim=-1) # (b, )
         t_bbox_valid_mask = max_cls_conf > cls_thr[:, None].expand(batch_size, max_cls_conf.size(-1))
         topk_t_bbox_inds = [
             t_bbox_valid_mask[i].nonzero(as_tuple=False).squeeze(1) 
                                                 for i in range(batch_size)
-        ] # Get ~2% total of boxes 
+        ] # Get ~5.59% total of boxes 
 
         #*********************** label ***********************
         topk_s_pred_scores = [
@@ -1130,7 +1131,7 @@ class v8ERDDetectionLoss:
         
         for i in range(batch_size):
             assert topk_s_pred_scores[i].size() == topk_t_pred_scores[i].size()
-            distill_loss[1] += self.hyp.dist_loss_weight * \
+            erd_loss[4] += self.hyp.dist_loss_weight * \
                         self.hyp.cls_disstil_gain * torch.mean((topk_s_pred_scores[i] - topk_t_pred_scores[i]).pow(2).float()) / batch_size
 
         #*********************** Valid Boxes ***********************
@@ -1170,12 +1171,210 @@ class v8ERDDetectionLoss:
             weight_targets = topk_s_pred_scores[i].reshape(-1, self.nc_origin).detach().sigmoid()
             weight_targets = weight_targets.max(dim=1)[0][topk_t_bbox_preds_nms_idx[i]]
 
-            distill_loss[0] += self.hyp.dist_loss_weight * self.kdl(
+            erd_loss[3] += self.hyp.dist_loss_weight * self.kdl(
                                                             s_topk_bbox_corner, t_topk_bbox_corner,
                                                             weight=weight_targets[:, None].expand(-1, 4).reshape(-1), 
-                                                            avg_factor=1.0
-                                                        )
+                                                            avg_factor=4.0
+                                                        ) * self.hyp.box 
+        
+        # bbox
+        # nms_topk_t_bbox_preds = [
+        #     topk_t_bbox_preds[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
+        # ]
 
-        return erd_loss.sum() * batch_size + distill_loss.sum(), \
-               erd_loss.detach() + distill_loss.detach() # loss(box, cls, dfl)
-    
+        # topk_s_bbox_preds = [
+        #     pred_bboxes[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        # ]
+        # nms_topk_s_bbox_preds = [
+        #     topk_s_bbox_preds[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
+        # ]
+
+        # distill_iou = 0
+        # for i in range(batch_size):
+        #     distill_iou += (1 - bbox_iou(nms_topk_s_bbox_preds[i], nms_topk_t_bbox_preds[i], xywh=False, CIoU=True).mean()) 
+        
+        # erd_loss[3] += distill_iou / batch_size * 1.5
+
+        return erd_loss.sum() * batch_size, \
+               erd_loss.detach() # loss(box, cls, dfl)
+
+
+class v8ERDSegmentationLoss(v8ERDDetectionLoss):
+    def __init__(self, model, add_on_indexes=None, tal_topk=10, nc_origin=80, t_stride=None):
+        super().__init__(model, add_on_indexes, tal_topk, nc_origin, t_stride)
+
+        self.overlap = model.args.overlap_mask
+
+    def __call__(self, preds, batch):
+        """Calculate and return the loss for the YOLO model."""
+        loss = torch.zeros(6, device=self.device)  # box, cls, dfl
+        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
+        batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        # B, grids, ..
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        pred_masks = pred_masks.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        try:
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        except RuntimeError as e:
+            raise TypeError(
+                "ERROR ❌ segment dataset incorrectly formatted or not a segment dataset.\n"
+                "This error can occur when incorrectly training a 'segment' model on a 'detect' dataset, "
+                "i.e. 'yolo train model=yolov8n-seg.pt data=coco8.yaml'.\nVerify your dataset is a "
+                "correctly formatted 'segment' dataset using 'data=coco8-seg.yaml' "
+                "as an example.\nSee https://docs.ultralytics.com/datasets/segment/ for help."
+            ) from e
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        if fg_mask.sum():
+            # Bbox loss
+            loss[0], loss[3] = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+            )
+            # Masks loss
+            masks = batch["masks"].to(self.device).float()
+            if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
+                masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
+
+            loss[1] = self.calculate_segmentation_loss(
+                fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
+            )
+
+        # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
+        else:
+            loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.box  # seg gain
+        loss[2] *= self.hyp.cls  # cls gain
+        loss[3] *= self.hyp.dfl  # dfl gain
+
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+
+    @staticmethod
+    def single_mask_loss(
+        gt_mask: torch.Tensor, pred: torch.Tensor, proto: torch.Tensor, xyxy: torch.Tensor, area: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the instance segmentation loss for a single image.
+
+        Args:
+            gt_mask (torch.Tensor): Ground truth mask of shape (n, H, W), where n is the number of objects.
+            pred (torch.Tensor): Predicted mask coefficients of shape (n, 32).
+            proto (torch.Tensor): Prototype masks of shape (32, H, W).
+            xyxy (torch.Tensor): Ground truth bounding boxes in xyxy format, normalized to [0, 1], of shape (n, 4).
+            area (torch.Tensor): Area of each ground truth bounding box of shape (n,).
+
+        Returns:
+            (torch.Tensor): The calculated mask loss for a single image.
+
+        Notes:
+            The function uses the equation pred_mask = torch.einsum('in,nhw->ihw', pred, proto) to produce the
+            predicted masks from the prototype masks and predicted mask coefficients.
+        """
+        pred_mask = torch.einsum("in,nhw->ihw", pred, proto)  # (n, 32) @ (32, 80, 80) -> (n, 80, 80)
+        loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+        return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).sum()
+
+    def calculate_segmentation_loss(
+        self,
+        fg_mask: torch.Tensor,
+        masks: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        batch_idx: torch.Tensor,
+        proto: torch.Tensor,
+        pred_masks: torch.Tensor,
+        imgsz: torch.Tensor,
+        overlap: bool,
+    ) -> torch.Tensor:
+        """
+        Calculate the loss for instance segmentation.
+
+        Args:
+            fg_mask (torch.Tensor): A binary tensor of shape (BS, N_anchors) indicating which anchors are positive.
+            masks (torch.Tensor): Ground truth masks of shape (BS, H, W) if `overlap` is False, otherwise (BS, ?, H, W).
+            target_gt_idx (torch.Tensor): Indexes of ground truth objects for each anchor of shape (BS, N_anchors).
+            target_bboxes (torch.Tensor): Ground truth bounding boxes for each anchor of shape (BS, N_anchors, 4).
+            batch_idx (torch.Tensor): Batch indices of shape (N_labels_in_batch, 1).
+            proto (torch.Tensor): Prototype masks of shape (BS, 32, H, W).
+            pred_masks (torch.Tensor): Predicted masks for each anchor of shape (BS, N_anchors, 32).
+            imgsz (torch.Tensor): Size of the input image as a tensor of shape (2), i.e., (H, W).
+            overlap (bool): Whether the masks in `masks` tensor overlap.
+
+        Returns:
+            (torch.Tensor): The calculated loss for instance segmentation.
+
+        Notes:
+            The batch loss can be computed for improved speed at higher memory usage.
+            For example, pred_mask can be computed as follows:
+                pred_mask = torch.einsum('in,nhw->ihw', pred, proto)  # (i, 32) @ (32, 160, 160) -> (i, 160, 160)
+        """
+        _, _, mask_h, mask_w = proto.shape
+        loss = 0
+
+        # Normalize to 0-1
+        target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
+
+        # Areas of target bboxes
+        marea = xyxy2xywh(target_bboxes_normalized)[..., 2:].prod(2)
+
+        # Normalize to mask size
+        mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
+
+        for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, marea, masks)):
+            fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, marea_i, masks_i = single_i
+            if fg_mask_i.any():
+                mask_idx = target_gt_idx_i[fg_mask_i]
+                if overlap:
+                    gt_mask = masks_i == (mask_idx + 1).view(-1, 1, 1)
+                    gt_mask = gt_mask.float()
+                else:
+                    gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
+
+                loss += self.single_mask_loss(
+                    gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
+                )
+
+            # WARNING: lines below prevents Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
+            else:
+                loss += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
+
+        return loss / fg_mask.sum()
