@@ -92,12 +92,11 @@ class DetectionTrainer(BaseTrainer):
                                       t_model_nc=self.Continuous.model[-1].nc,
                                       t_stride=self.Continuous.model[-1].stride, 
                                       add_on_indexs=self.add_on_indexes)
+            if weights:
+                model.load(weights, ori_nc=self.Continuous.model[-1].nc)
         else:
             model = DetectionModel(cfg, nc=self.data["nc"], verbose=verbose and RANK == -1)
-        if weights:
-            if self.Continuous is not None:
-                model.load(weights, ori_nc=self.Continuous.model[-1].nc)
-            else:
+            if weights:
                 model.load(weights)
         return model
 
@@ -127,7 +126,7 @@ class DetectionTrainer(BaseTrainer):
 
     def progress_string(self):
         """Returns a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
-        return ("\n" + "%13s" * (4 + len(self.loss_names))) % (
+        return ("\n" + "%11s" * 2 +  "%13s"* (len(self.loss_names)) + "%11s" * 2) % (
             "Epoch",
             "GPU_mem",
             *self.loss_names,

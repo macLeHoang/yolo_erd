@@ -67,7 +67,8 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
-    v8ERDDetectionLoss
+    v8ERDDetectionLoss,
+    v8ERDSegmentationLoss
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -466,6 +467,17 @@ class SegmentationModel(DetectionModel):
         """Initialize the loss criterion for the SegmentationModel."""
         return v8SegmentationLoss(self)
 
+class SegmentationModelERD(DetectionModelErd):
+    def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True, t_model_nc=None, t_stride=None, add_on_indexs=None):
+        super().__init__(cfg, ch, nc, verbose, t_model_nc, t_stride, add_on_indexs)
+    
+    def init_criterion(self):
+        return v8ERDSegmentationLoss(
+                self, 
+                self.add_on_indexes, 
+                nc_origin=self.nc_origin, 
+                t_stride=self.t_stride
+            )
 
 class PoseModel(DetectionModel):
     """YOLOv8 pose model."""

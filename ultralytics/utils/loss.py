@@ -977,7 +977,7 @@ class v8ERDDetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
-        self.kdl = KnowledgeDistillationKLDivLoss(loss_weight=self.hyp.kl_gain, T=10).to(device) # T = 5
+        self.kdl = KnowledgeDistillationKLDivLoss(loss_weight=self.hyp.kl_box, T=10).to(device) # T = 5
         self.qfl = QualityFocalLoss()
 
         self.t_no = nc_origin + m.reg_max * 4
@@ -1017,7 +1017,7 @@ class v8ERDDetectionLoss:
 
     def __call__(self, preds, t_preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        erd_loss = torch.zeros(5, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(5, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1)
@@ -1052,48 +1052,47 @@ class v8ERDDetectionLoss:
         # when using ERD, selected add-on classes only for calculating loss with ground-truth
         erd_pred_scores = pred_scores[:, :, self.add_on_indexes]
         erd_target_scores = target_scores[:, :, self.add_on_indexes]
-
-        target_bboxes /= stride_tensor
         target_scores_sum = max(erd_target_scores.sum(), 1)
 
         # cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        # erd_loss[1] = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = self.bce(erd_pred_scores, erd_target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
-        try:
-            bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
-        except:
-            fg_mask = fg_mask.bool()
-            bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
+        # try:
+        #     bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
+        # except:
+        #     fg_mask = fg_mask.bool()
+        #     bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
 
-        scores = torch.zeros(batch_size, pred_scores.size(1)).to(self.device)
-        label_weights = torch.ones(batch_size, pred_scores.size(1)).to(self.device)
-        for i in range(batch_size):
-            # scores = bbox_iou(pred_bboxes[i][fg_mask[i]], target_bboxes[i][fg_mask[i]], xywh=False, CIoU=True).squeeze()
-            scores = target_scores[i]
-            erd_loss[1] += self.qfl(
-                pred_scores[i], (target_labels[i].to(dtype), scores.to(dtype)),
-                label_weights[i],
-                fg_mask[i],
-                self.add_on_indexes,
-                avg_factor=1.0
-            ).sum()
+        # scores = torch.zeros(batch_size, pred_scores.size(1)).to(self.device)
+        # label_weights = torch.ones(batch_size, pred_scores.size(1)).to(self.device)
+        # for i in range(batch_size):
+        #     # scores = bbox_iou(pred_bboxes[i][fg_mask[i]], target_bboxes[i][fg_mask[i]], xywh=False, CIoU=True).squeeze()
+        #     scores = target_scores[i]
+        #     loss[1] += self.qfl(
+        #         pred_scores[i], (target_labels[i].to(dtype), scores.to(dtype)),
+        #         label_weights[i],
+        #         fg_mask[i],
+        #         self.add_on_indexes,
+        #         avg_factor=1.0
+        #     ).sum()
 
-        d = 0.25
-        erd_loss[1] = d * erd_loss[1] / target_scores_sum + (1 - d) * bce 
+        # d = 0.35
+        # loss[1] = d * loss[1] / target_scores_sum + (1 - d) * bce 
 
         # bbox loss
         if fg_mask.sum():
-            erd_loss[0], erd_loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, erd_target_scores,
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, erd_target_scores,
                                               target_scores_sum, fg_mask)
 
-        erd_loss[0] *= self.hyp.box  # box gain
-        erd_loss[1] *= self.hyp.cls  # cls gain
-        erd_loss[2] *= self.hyp.dfl  # dfl gain
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
 
         # When validatiing or testing, there are no predictions from t_model
         if t_preds is None:
-            return erd_loss.sum() * batch_size, erd_loss.detach()
+            return loss.sum() * batch_size, loss.detach()
         
         ################################ Distill Loss #################################################
         # distill_loss = torch.zeros(3, device=self.device)  # box, cls, dfl=0
@@ -1114,7 +1113,7 @@ class v8ERDDetectionLoss:
 
         t_cls_conf = t_pred_scores.sigmoid()
         max_cls_conf, ids = t_cls_conf.max(dim=-1) # (b, h*w)
-        cls_thr = max_cls_conf.mean(dim=-1) + 2.11 * max_cls_conf.std(dim=-1) # (b, )
+        cls_thr = max_cls_conf.mean(dim=-1) + 2.0 * max_cls_conf.std(dim=-1) # (b, )
         t_bbox_valid_mask = max_cls_conf > cls_thr[:, None].expand(batch_size, max_cls_conf.size(-1))
         topk_t_bbox_inds = [
             t_bbox_valid_mask[i].nonzero(as_tuple=False).squeeze(1) 
@@ -1131,37 +1130,25 @@ class v8ERDDetectionLoss:
         
         for i in range(batch_size):
             assert topk_s_pred_scores[i].size() == topk_t_pred_scores[i].size()
-            erd_loss[4] += self.hyp.dist_loss_weight * \
-                        self.hyp.cls_disstil_gain * torch.mean((topk_s_pred_scores[i] - topk_t_pred_scores[i]).pow(2).float()) / batch_size
+            loss[4] += self.hyp.distill_weight * \
+                        self.hyp.cls_distill * torch.mean((topk_s_pred_scores[i] - topk_t_pred_scores[i]).pow(2).float()) / batch_size
 
         #*********************** Valid Boxes ***********************
-        topk_t_bbox_preds = [
-            t_pred_bboxes[i, topk_t_bbox_inds[i]] for i in range(batch_size)
-        ]
-        topk_t_conf = [
-            max_cls_conf[i, topk_t_bbox_inds[i]] for i in range(batch_size)
-        ]
         topk_t_bbox_preds_nms_idx = [
             nms(
-                topk_t_bbox_preds[i], 
-                topk_t_conf[i],
+                t_pred_bboxes[i, topk_t_bbox_inds[i]], # topk_t_bbox_preds
+                max_cls_conf[i, topk_t_bbox_inds[i]],  # topk_t_conf
                 iou_threshold=self.hyp.iou
             )[:self.hyp.max_det]
             for i in range(batch_size)
         ]
-
-        topk_t_bbox_distri = [
-            t_pred_distri[i, topk_t_bbox_inds[i]] for i in range(batch_size)
-        ]
         nms_topk_t_bbox_distri = [
-            topk_t_bbox_distri[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
-        ]
-
-        topk_s_bbox_distri = [
-            pred_distri[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+            (t_pred_distri[i, topk_t_bbox_inds[i]])[topk_t_bbox_preds_nms_idx[i]] 
+                                                                for i in range(batch_size)
         ]
         nms_topk_s_bbox_distri = [
-            topk_s_bbox_distri[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
+            (pred_distri[i, topk_t_bbox_inds[i]])[topk_t_bbox_preds_nms_idx[i]] 
+                                                                for i in range(batch_size)
         ]
 
         for i in range(batch_size):
@@ -1171,32 +1158,14 @@ class v8ERDDetectionLoss:
             weight_targets = topk_s_pred_scores[i].reshape(-1, self.nc_origin).detach().sigmoid()
             weight_targets = weight_targets.max(dim=1)[0][topk_t_bbox_preds_nms_idx[i]]
 
-            erd_loss[3] += self.hyp.dist_loss_weight * self.kdl(
-                                                            s_topk_bbox_corner, t_topk_bbox_corner,
-                                                            weight=weight_targets[:, None].expand(-1, 4).reshape(-1), 
-                                                            avg_factor=4.0
-                                                        ) * self.hyp.box 
-        
-        # bbox
-        # nms_topk_t_bbox_preds = [
-        #     topk_t_bbox_preds[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
-        # ]
+            loss[3] += self.hyp.distill_weight * self.kdl(
+                                                    s_topk_bbox_corner, t_topk_bbox_corner,
+                                                    weight=weight_targets[:, None].expand(-1, 4).reshape(-1), 
+                                                    avg_factor=4.0
+                                                ) * self.hyp.box 
 
-        # topk_s_bbox_preds = [
-        #     pred_bboxes[i, topk_t_bbox_inds[i]] for i in range(batch_size)
-        # ]
-        # nms_topk_s_bbox_preds = [
-        #     topk_s_bbox_preds[i][topk_t_bbox_preds_nms_idx[i]] for i in range(batch_size)
-        # ]
-
-        # distill_iou = 0
-        # for i in range(batch_size):
-        #     distill_iou += (1 - bbox_iou(nms_topk_s_bbox_preds[i], nms_topk_t_bbox_preds[i], xywh=False, CIoU=True).mean()) 
-        
-        # erd_loss[3] += distill_iou / batch_size * 1.5
-
-        return erd_loss.sum() * batch_size, \
-               erd_loss.detach() # loss(box, cls, dfl)
+        return loss.sum() * batch_size, \
+               loss.detach() # loss(box, cls, dfl)
 
 
 class v8ERDSegmentationLoss(v8ERDDetectionLoss):
@@ -1205,11 +1174,11 @@ class v8ERDSegmentationLoss(v8ERDDetectionLoss):
 
         self.overlap = model.args.overlap_mask
 
-    def __call__(self, preds, batch):
+    def __call__(self, preds, t_preds, batch):
         """Calculate and return the loss for the YOLO model."""
-        loss = torch.zeros(6, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(7, device=self.device)  # box, cls, dfl
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
-        batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
+        batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width, 1, 32, 160, 160
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
         )
@@ -1217,7 +1186,7 @@ class v8ERDSegmentationLoss(v8ERDDetectionLoss):
         # B, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-        pred_masks = pred_masks.permute(0, 2, 1).contiguous()
+        pred_masks = pred_masks.permute(0, 2, 1).contiguous() # 1, 32, 8400
 
         dtype = pred_scores.dtype
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
@@ -1242,7 +1211,7 @@ class v8ERDSegmentationLoss(v8ERDDetectionLoss):
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
-        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+        target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -1251,11 +1220,38 @@ class v8ERDSegmentationLoss(v8ERDDetectionLoss):
             mask_gt,
         )
 
-        target_scores_sum = max(target_scores.sum(), 1)
+        erd_pred_scores = pred_scores[:, :, self.add_on_indexes]
+        erd_target_scores = target_scores[:, :, self.add_on_indexes]
+        target_scores_sum = max(erd_target_scores.sum(), 1)
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        
+        # try:
+            
+        #     bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
+        # except:
+        #     fg_mask = fg_mask.bool()
+        #     bce = self.bce(erd_pred_scores[fg_mask], erd_target_scores[fg_mask].to(dtype)).sum() / target_scores_sum
+
+        # scores = torch.zeros(batch_size, pred_scores.size(1)).to(self.device)
+        # label_weights = torch.ones(batch_size, pred_scores.size(1)).to(self.device)
+        # for i in range(batch_size):
+        #     # scores = bbox_iou(pred_bboxes[i][fg_mask[i]], target_bboxes[i][fg_mask[i]], xywh=False, CIoU=True).squeeze()
+        #     scores = target_scores[i]
+        #     loss[2] += self.qfl(
+        #         pred_scores[i], (target_labels[i].to(dtype), scores.to(dtype)),
+        #         label_weights[i],
+        #         fg_mask[i],
+        #         self.add_on_indexes,
+        #         avg_factor=1.0
+        #     ).sum()
+
+        # d = 0.35
+        # loss[2] = d * loss[2] / target_scores_sum + (1 - d) * bce
+
+        loss[2] = self.bce(erd_pred_scores, erd_target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         if fg_mask.sum():
             # Bbox loss
@@ -1285,6 +1281,88 @@ class v8ERDSegmentationLoss(v8ERDDetectionLoss):
         loss[1] *= self.hyp.box  # seg gain
         loss[2] *= self.hyp.cls  # cls gain
         loss[3] *= self.hyp.dfl  # dfl gain
+
+        # When validatiing or testing, there are no predictions from t_model
+        if t_preds is None:
+            return loss.sum() * batch_size, loss.detach()
+        
+        ################################ Distill Loss #################################################
+        # distill_loss = torch.zeros(3, device=self.device)  # box, cls, dfl=0
+        t_feats, t_pred_masks, t_proto = t_preds if len(t_preds) == 3 else t_preds[1]
+        t_pred_distri, t_pred_scores = torch.cat([xi.view(t_feats[0].shape[0], self.t_no, -1) for xi in t_feats], 2).split(
+            (self.reg_max * 4, self.nc_origin), 1)
+        
+        t_pred_scores = t_pred_scores.permute(0, 2, 1).contiguous() # [1, 8400, nc]
+        t_pred_distri = t_pred_distri.permute(0, 2, 1).contiguous() # [1, 8400, 64]
+        t_pred_masks = t_pred_masks.permute(0, 2, 1).contiguous() # [1, 8400, 32]
+        s_pred_scores = pred_scores[:, :, :self.nc_origin]
+
+        # Get techer's valid boxes
+        t_anchor_points, t_stride_tensor = make_anchors(t_feats, self.t_stride, 0.5)
+        t_pred_bboxes = self.bbox_decode(t_anchor_points, t_pred_distri)  # xyxy, (b, h*w, 4)
+        t_pred_bboxes = t_pred_bboxes * t_stride_tensor
+
+        t_cls_conf = t_pred_scores.sigmoid()
+        max_cls_conf, ids = t_cls_conf.max(dim=-1) # (b, h*w)
+        cls_thr = max_cls_conf.mean(dim=-1) + 2.0 * max_cls_conf.std(dim=-1) # (b, )
+        t_bbox_valid_mask = max_cls_conf > cls_thr[:, None].expand(batch_size, max_cls_conf.size(-1))
+        topk_t_bbox_inds = [
+            t_bbox_valid_mask[i].nonzero(as_tuple=False).squeeze(1) 
+                                                for i in range(batch_size)
+        ] # Get ~5.59% total of boxes 
+
+        #*********************** label ***********************
+        topk_s_pred_scores = [
+            s_pred_scores[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        topk_t_pred_scores = [
+            t_pred_scores[i, topk_t_bbox_inds[i]] for i in range(batch_size)
+        ]
+        
+        for i in range(batch_size):
+            assert topk_s_pred_scores[i].size() == topk_t_pred_scores[i].size()
+            loss[5] += self.hyp.distill_weight * \
+                        self.hyp.cls_distill * torch.mean((topk_s_pred_scores[i] - topk_t_pred_scores[i]).pow(2).float()) / batch_size
+
+        #*********************** Valid Boxes ***********************
+        topk_t_bbox_preds_nms_idx = [
+            nms(
+                t_pred_bboxes[i, topk_t_bbox_inds[i]], # topk_t_bbox_preds
+                max_cls_conf[i, topk_t_bbox_inds[i]],  # topk_t_conf
+                iou_threshold=self.hyp.iou
+            )[:self.hyp.max_det]
+            for i in range(batch_size)
+        ]
+        nms_topk_t_bbox_distri = [
+            (t_pred_distri[i, topk_t_bbox_inds[i]])[topk_t_bbox_preds_nms_idx[i]] 
+                                                                for i in range(batch_size)
+        ]
+        nms_topk_s_bbox_distri = [
+            (pred_distri[i, topk_t_bbox_inds[i]])[topk_t_bbox_preds_nms_idx[i]] 
+                                                                for i in range(batch_size)
+        ]
+
+        for i in range(batch_size):
+            s_topk_bbox_corner = nms_topk_s_bbox_distri[i].reshape(-1, self.reg_max)
+            t_topk_bbox_corner = nms_topk_t_bbox_distri[i].reshape(-1, self.reg_max)
+
+            weight_targets = topk_s_pred_scores[i].reshape(-1, self.nc_origin).detach().sigmoid()
+            weight_targets = weight_targets.max(dim=1)[0][topk_t_bbox_preds_nms_idx[i]]
+
+            loss[4] += self.hyp.distill_weight * self.kdl(
+                                                    s_topk_bbox_corner, t_topk_bbox_corner,
+                                                    weight=weight_targets[:, None].expand(-1, 4).reshape(-1), 
+                                                    avg_factor=4.0
+                                                ) * self.hyp.box
+        
+        #*********************** Valid Masks ***********************
+        for i in range(batch_size):
+            t_masks = torch.einsum("in,nhw->ihw", t_pred_masks[i], t_proto[i])
+            masks = torch.einsum("in,nhw->ihw", pred_masks[i], proto[i])
+            topk_t_masks = t_masks[topk_t_bbox_inds[i]]
+            topk_masks = masks[topk_t_bbox_inds[i]]
+
+            loss[6] += self.hyp.distill_weight * torch.mean((topk_t_masks - topk_masks).pow(2).float()) / batch_size
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 

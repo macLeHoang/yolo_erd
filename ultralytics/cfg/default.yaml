@@ -127,6 +127,7 @@ tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yam
 
 # Continuous settings ------------------------------------------------------------------------------------------------------
 Continuous: null
-kl_gain: 1.0
-cls_disstil_gain: 1.0
-dist_loss_weight: 1.0
+kl_box: 1.0
+cls_distill: 1.0
+seg_distill: 1.0
+distill_weight: 1.0
